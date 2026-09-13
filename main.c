@@ -5740,34 +5740,15 @@ static bool koi_pond_init(Renderer *r, KoiPondRenderer *pond) {
     }
     static VkFormat color_formats[1];
     color_formats[0]                 = r->hdr_color[0].format;
-    GraphicsPipelineConfig koiconfig = {
-        .vert_path = "compiledshaders/koi_pond.vert.spv",
-        .frag_path = "compiledshaders/koi_pond.frag.spv",
+    GraphicsPipelineConfig koiconfig = pipeline_config_default();
 
-        // Fullscreen triangle has no meaningful back/front face.
-        .cull_mode    = VK_CULL_MODE_NONE,
-        .front_face   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .polygon_mode = VK_POLYGON_MODE_FILL,
+    koiconfig.vert_path = "compiledshaders/koi_pond.vert.spv",
+    koiconfig.frag_path = "compiledshaders/koi_pond.frag.spv",
 
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    koiconfig.depth_test_enable = false, koiconfig.depth_write_enable = false,
+    koiconfig.depth_compare_op = VK_COMPARE_OP_ALWAYS,
 
-        // The pond shader produces a complete image. Depth testing is
-        // unnecessary because there are no scene depth relationships here.
-        .depth_test_enable  = false,
-        .depth_write_enable = false,
-        .depth_compare_op   = VK_COMPARE_OP_ALWAYS,
-
-        .color_attachment_count = 1,
-        .color_formats          = color_formats,
-
-        // No depth attachment participates in dynamic rendering.
-        .depth_format = VK_FORMAT_UNDEFINED,
-
-        // The shader writes the final HDR pixel directly.
-        // Zero-initialized blend state should mean blending disabled in
-        // your ColorAttachmentBlend implementation.
-        .blends = {0},
-    };
+    koiconfig.color_attachment_count = 1, koiconfig.color_formats = color_formats,
 
     r->EnginePipelines.koi_pond = pipeline_create_graphics(r, &koiconfig);
     return true;
