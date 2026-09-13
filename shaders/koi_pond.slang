@@ -845,6 +845,8 @@ float4 fs_main(VSOutput input) : SV_Target0
     // Preserve the source's deliberately 3:1 pond-space coordinates.
     float2 P = float2(uv.x * 3.0, uv.y);
     float t = global_data.time;
+    KoiPondGpu* koi_pond = (KoiPondGpu*)push.pond_address;
+    float panic = saturate(koi_pond->game_misc.z);
 
     // -------------------------------------------------------------------------
     // Water displacement -> analytic surface normal
@@ -976,6 +978,8 @@ float4 fs_main(VSOutput input) : SV_Target0
 
     col *= lerp(0.72,1.0,vig);
     col *= lerp(0.60,1.0,smoothstep(0.0,0.09,edgeD));
+
+    col = lerp(col, col * float3(1.10, 0.58, 0.48), panic * 0.22);
 
     col = clamp(col,0.0,1.6);
 

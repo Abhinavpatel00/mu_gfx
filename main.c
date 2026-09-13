@@ -4402,6 +4402,7 @@ static MU_INLINE void frame_start(Renderer *r) {
     uint64_t frame_now = mu_time_now();
     r->cpu_frame_ns    = (double)(frame_now - r->cpu_prev_frame);
     r->cpu_prev_frame  = frame_now;
+    r->dt              = (float)(r->cpu_frame_ns / 1000000000.0);
     r->current_frame   = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
     int fb_w, fb_h;
@@ -5729,6 +5730,78 @@ void koi_game_write_gpu(const KoiGame *game, KoiPondGpu *gpu) {
 
     gpu->game_misc[3] = (float)game->food_stock;
 }
+
+static void koi_game_handle_input(Renderer *r, KoiGame *game) {
+    static bool left_was_down = false;
+    static bool right_was_down = false;
+    static bool enter_was_down = false;
+
+    int window_width = 0;
+    int window_height = 0;
+    glfwGetWindowSize(r->window, &window_width, &window_height);
+
+    double cursor_x = 0.0;
+    double cursor_y = 0.0;
+    glfwGetCursorPos(r->window, &cursor_x, &cursor_y);
+
+    bool cursor_in_pond = window_width > 0 && window_height > 0 && cursor_x >= 0.0 && cursor_y >= 0.0 &&
+                          cursor_x < (double)window_width && cursor_y < (double)window_height;
+    vec2 pond_position = {
+        (float)(cursor_x / (double)window_width) * 3.0f,
+        (float)(cursor_y / (double)window_height),
+    };
+
+    bool left_down = glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    bool right_down = glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    bool enter_down = glfwGetKey(r->window, GLFW_KEY_ENTER) == GLFW_PRESS;
+
+    if (cursor_in_pond && left_down && !left_was_down)
+        koi_game_input(game, KOI_INPUT_FEED, pond_position);
+    if (cursor_in_pond && right_down && !right_was_down)
+        koi_game_input(game, KOI_INPUT_STIR, pond_position);
+    if (enter_down && !enter_was_down && game->state != KOI_GAME_PLAYING)
+        koi_game_restart(game);
+
+    left_was_down = left_down;
+    right_was_down = right_down;
+    enter_was_down = enter_down;
+}
+
+static void render_koi_game_ui(KoiGame *game) {
+    static bool show = true;
+    ImVec4_c accent = {0.42f, 0.91f, 0.84f, 1.0f};
+    ImVec4_c warning = {1.0f, 0.54f, 0.28f, 1.0f};
+
+    igSetNextWindowPos((ImVec2_c){20.0f, 650.0f}, ImGuiCond_FirstUseEver, (ImVec2_c){0.0f, 0.0f});
+    if (!igBegin("Pond Keeper", &show, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        igEnd();
+        return;
+    }
+
+    igTextColored(accent, "POND KEEPER");
+    igSeparator();
+    igText("Score  %u", game->score);
+    igText("Fish fed  %u / 12", game->eaten_count);
+    igText("Food  %u", game->food_stock);
+    igText("Time  %.0f s", game->round_time);
+
+    if (game->combo > 1)
+        igTextColored(accent, "Combo x%u", game->combo);
+
+    if (game->panic > 0.35f)
+        igTextColored(warning, "The pond is unsettled");
+    else if (game->state == KOI_GAME_PLAYING)
+        igTextDisabled("Left click: feed   Right click: ripple");
+
+    if (game->state != KOI_GAME_PLAYING) {
+        igSeparator();
+        igTextColored(game->state == KOI_GAME_WON ? accent : warning,
+                      game->state == KOI_GAME_WON ? "Pond restored" : "The koi need a calmer pond");
+        igTextDisabled("Press Enter to begin again");
+    }
+
+    igEnd();
+}
 static bool koi_pond_init(Renderer *r, KoiPondRenderer *pond) {
     KoiPondGpu zero = {0};
 
@@ -5916,6 +5989,7 @@ int main() {
         //
         KoiPondPush push = {};
 
+        koi_game_handle_input(r, &game);
         koi_game_update(&game, r->dt);
 
         BufferSlice snapshot_slice = buffer_pool_alloc(&r->cpu_pool, sizeof(KoiPondGpu), 16);
@@ -5940,6 +6014,7 @@ int main() {
         post_pass(r, cmd);
         pass_smaa(r, cmd);
         pass_ldr_to_swapchain(r, cmd);
+        render_koi_game_ui(&game);
         render_gpu_profiler_ui(r);
         render_capture_ui(r);
         igRender();
