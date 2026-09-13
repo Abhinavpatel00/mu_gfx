@@ -1,6 +1,7 @@
 #include "../common.h"
 #include "../external/xxHash/xxhash.h"
 #include <errno.h>
+#include <sys/stat.h>
 /*
 
 whatevet the fuck u write no one cares here 
@@ -647,3 +648,64 @@ static bool trigger_shader_compilation(void) {
     return true;
 }
 
+
+//TODO: windows port 
+static bool mkdir_p(const char *path) {
+    if (!path || !*path)
+        return false;
+
+    char tmp[1024];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp))
+        return false;
+    memcpy(tmp, path, len + 1);
+
+    // Strip trailing slashes
+    while (len > 1 && tmp[len - 1] == '/')
+        tmp[--len] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+                return false;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+        return false;
+
+    return true;
+}
+
+
+static bool capture_ensure_dirs(void) {
+    if (!mkdir_p(CAPTURE_SCREENSHOT_DIR) || !mkdir_p(CAPTURE_VIDEO_DIR)) {
+        log_error("[capture] failed to create capture directories: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+
+// Produce something like "captures/screenshots/screenshot_2026-09-12_08-13-03.png"
+// Uses wall-clock time so the name is sortable and unique across runs.
+static void capture_make_screenshot_path(char *out, size_t out_size) {
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    snprintf(out, out_size,
+             CAPTURE_SCREENSHOT_DIR "/screenshot_%04d-%02d-%02d_%02d-%02d-%02d.png",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+static void capture_make_video_path(char *out, size_t out_size) {
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    snprintf(out, out_size,
+             CAPTURE_VIDEO_DIR "/recording_%04d-%02d-%02d_%02d-%02d-%02d.mp4",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+}

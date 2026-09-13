@@ -7,6 +7,7 @@
 #include "src/slangtypes.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <vulkan/vulkan_core.h>
 // ids
 
 typedef uint32_t TextureID;
@@ -477,6 +478,7 @@ typedef struct {
         uint32_t beam;
         uint32_t sky;
         uint32_t skinning;
+        uint32_t koi_pond;
     } EnginePipelines;
 
 } Renderer;
@@ -3002,6 +3004,11 @@ void capture_init(Renderer *r, uint32_t w, uint32_t h) {
     c->png_scratch = malloc((size_t)w * h * 4);
     c->inited      = true;
 
+    if (!capture_ensure_dirs()) {
+        // Don't hard-fail — just disable capture so the app still runs.
+        log_warn("[capture] disabled: cannot create output directories");
+        return;
+    }
     log_info("[capture] ready %ux%u (%d slots, bgra=%d)", w, h, CAPTURE_SLOTS, (int)c->src_is_bgra);
 }
 
@@ -3075,8 +3082,7 @@ bool capture_start_video(Renderer *r, const char *path, uint32_t fps) {
              "-f rawvideo -pix_fmt %s -s %ux%u -r %u -i - "
              "-vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\" "
              "-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \"%s\"",
-             c->src_is_bgra ? "bgra" : "rgba",
-             c->width, c->height, fps, path);
+             c->src_is_bgra ? "bgra" : "rgba", c->width, c->height, fps, path);
 
     FILE *p = popen(cmd, "w");
     if (!p) {
@@ -4213,7 +4219,7 @@ void graphics_init(void) {
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = false,
-        .enable_validation           = false,
+        .enable_validation           = VALIDATION,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -5080,6 +5086,19 @@ FORCE_INLINE void imgui_begin_frame(void) {
     ImGui_ImplGlfw_NewFrame();
     igNewFrame();
 }
+
+bool capture_take_screenshot_auto(Renderer *r) {
+    char path[512];
+    capture_make_screenshot_path(path, sizeof(path));
+    return capture_take_screenshot(r, path);
+}
+
+bool capture_start_video_auto(Renderer *r, uint32_t fps) {
+    char path[512];
+    capture_make_video_path(path, sizeof(path));
+    return capture_start_video(r, path, fps);
+}
+
 static void render_capture_ui(Renderer *r) {
     CaptureState *c = &r->capture;
     if (!c->inited)
@@ -5098,13 +5117,7 @@ static void render_capture_ui(Renderer *r) {
 
     // ---- Screenshot ----
     if (igButton("Screenshot", (ImVec2_c){-1.0f, 0.0f})) {
-        char path[256];
-        snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
-        if (capture_take_screenshot(r, path)) {
-            log_info("[ui] screenshot queued: %s", path);
-        } else {
-            log_warn("[ui] screenshot request rejected");
-        }
+        capture_take_screenshot_auto(r);
     }
 
     igSeparator();
@@ -5112,11 +5125,7 @@ static void render_capture_ui(Renderer *r) {
     // ---- Recording ----
     if (!c->recording) {
         if (igButton("Start Recording", (ImVec2_c){-1.0f, 0.0f})) {
-            char path[256];
-            snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)glfwGetTime());
-            if (!capture_start_video(r, path, 60)) {
-                log_error("[ui] failed to start recording");
-            }
+            capture_start_video_auto(r, 60);
         }
     } else {
         ImVec4_c rec_col = {1.0f, 0.3f, 0.3f, 1.0f};
@@ -5133,9 +5142,723 @@ static void render_capture_ui(Renderer *r) {
 
     igEnd();
 }
+FORCE_INLINE VkDeviceAddress buffer_slice_address(const Renderer *r, BufferSlice slice) {
+    VkBufferDeviceAddressInfo info = {
+        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = slice.buffer,
+    };
+    return vkGetBufferDeviceAddress(r->devc.device, &info) + slice.offset;
+}
+enum {
+    KOI_FISH_COUNT   = 6,
+    KOI_RIPPLE_COUNT = 24,
+    KOI_FOOD_COUNT   = 8,
+};
+
+typedef enum KoiGameState {
+    KOI_GAME_PLAYING,
+    KOI_GAME_WON,
+    KOI_GAME_LOST,
+} KoiGameState;
+
+typedef enum KoiInputButton {
+    KOI_INPUT_NONE,
+    KOI_INPUT_FEED,
+    KOI_INPUT_STIR,
+} KoiInputButton;
+
+typedef struct KoiFish {
+    vec2 position;
+    vec2 velocity;
+    vec2 target;
+
+    float size;
+    float heading;
+    float wag;
+    float cruise;
+
+    float hunger;
+    float fear;
+    float happiness;
+
+    uint32_t type;
+    float    seed;
+} KoiFish;
+
+typedef struct KoiRipple {
+    vec2  position;
+    float birth_time;
+    float amplitude;
+} KoiRipple;
+
+typedef struct KoiFood {
+    vec2     position;
+    float    life;
+    float    value;
+    uint32_t active;
+} KoiFood;
+
+typedef struct KoiGame {
+    KoiFish   fish[KOI_FISH_COUNT];
+    KoiRipple ripples[KOI_RIPPLE_COUNT];
+    KoiFood   food[KOI_FOOD_COUNT];
+
+    uint32_t ripple_cursor;
+    uint32_t rng_state;
+
+    uint32_t score;
+    uint32_t food_stock;
+    uint32_t eaten_count;
+    uint32_t combo;
+
+    float time;
+    float panic;
+    float round_time;
+    float combo_time;
+
+    KoiGameState state;
+} KoiGame;
+
+typedef struct KoiPondGpu {
+    vec4 fish[KOI_FISH_COUNT];
+    vec4 fish_meta[KOI_FISH_COUNT];
+
+    vec4 ripple[KOI_RIPPLE_COUNT];
+
+    vec4 food[KOI_FOOD_COUNT];
+
+    vec4 game_misc;
+} KoiPondGpu;
+
+void koi_game_init(KoiGame *game, uint32_t seed);
+void koi_game_update(KoiGame *game, float dt);
+void koi_game_input(KoiGame *game, KoiInputButton button, const vec2 pond_position);
+
+void koi_game_write_gpu(const KoiGame *game, KoiPondGpu *gpu);
+
+void koi_game_restart(KoiGame *game);
+typedef struct KoiPondFrame {
+    BufferSlice gpu_data;
+} KoiPondFrame;
+
+typedef struct KoiPondRenderer {
+    KoiPondFrame frames[MAX_FRAMES_IN_FLIGHT];
+} KoiPondRenderer;
+
+#define KOI_PI         3.14159265358979323846f
+#define KOI_TAU        6.28318530717958647692f
+#define KOI_ROUND_TIME 60.0f
+
+static const float k_pad_x[19] = {0.10f, 0.30f, 0.02f, 0.24f, 0.06f, 0.20f, 0.15f, 0.45f, 0.75f, 2.62f,
+                                  2.88f, 2.96f, 2.45f, 2.94f, 2.80f, 2.50f, 2.06f, 2.24f, 1.72f};
+
+static const float k_pad_y[19] = {0.940f, 0.965f, 0.760f, 0.800f, 0.420f, 0.280f, 0.070f, 0.045f, 0.040f, 0.945f,
+                                  0.895f, 0.700f, 0.830f, 0.450f, 0.095f, 0.045f, 0.600f, 0.360f, 0.800f};
+
+static const float k_pad_radius[19] = {0.150f, 0.115f, 0.115f, 0.085f, 0.125f, 0.095f, 0.145f, 0.105f, 0.085f, 0.160f,
+                                       0.125f, 0.100f, 0.080f, 0.115f, 0.135f, 0.090f, 0.095f, 0.070f, 0.060f};
+
+static float koi_rand01(KoiGame *game) {
+    /*
+        Xorshift gives deterministic simulation randomness without libc rand
+        state. Determinism becomes valuable once replay/debugging exists.
+    */
+    uint32_t x = game->rng_state;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+
+    game->rng_state = x ? x : 0x6d2b79f5u;
+
+    return (float)(game->rng_state & 0x00ffffffu) / 16777215.0f;
+}
+
+static float koi_length(const vec2 v) { return glm_vec2_norm(v); }
+
+static float koi_distance(const vec2 a, const vec2 b) {
+    vec2 delta;
+    glm_vec2_sub(a, b, delta);
+    return koi_length(delta);
+}
+
+static void koi_normalize(vec2 v) {
+    float length = koi_length(v);
+
+    if (length > 1e-6f)
+        glm_vec2_scale(v, 1.0f / length, v);
+    else
+        glm_vec2_zero(v);
+}
+
+static bool koi_is_valid_target(const vec2 position, float fish_size) {
+    for (uint32_t i = 0; i < 19; ++i) {
+        float dx = position[0] - k_pad_x[i];
+        float dy = position[1] - k_pad_y[i];
+
+        float radius = k_pad_radius[i] + 0.16f + fish_size;
+
+        if (dx * dx + dy * dy < radius * radius)
+            return false;
+    }
+
+    return position[0] >= 0.45f && position[0] <= 2.55f && position[1] >= 0.20f && position[1] <= 0.80f;
+}
+
+static void koi_set_target(KoiGame *game, KoiFish *fish) {
+    for (uint32_t attempt = 0; attempt < 12; ++attempt) {
+        vec2 target = {
+            0.50f + koi_rand01(game) * 2.00f,
+            0.22f + koi_rand01(game) * 0.56f,
+        };
+
+        if (koi_is_valid_target(target, fish->size)) {
+            glm_vec2_copy(target, fish->target);
+            return;
+        }
+    }
+
+    glm_vec2_copy((vec2){1.5f, 0.5f}, fish->target);
+}
+
+static void koi_push_ripple(KoiGame *game, const vec2 position, float amplitude) {
+    uint32_t index = game->ripple_cursor;
+
+    glm_vec2_copy(position, game->ripples[index].position);
+
+    game->ripples[index].birth_time = game->time;
+    game->ripples[index].amplitude  = amplitude;
+
+    game->ripple_cursor = (index + 1u) % KOI_RIPPLE_COUNT;
+}
+
+static void koi_stir(KoiGame *game, const vec2 position) {
+    koi_push_ripple(game, position, 0.0038f);
+
+    for (uint32_t i = 0; i < KOI_FISH_COUNT; ++i) {
+        KoiFish *fish = &game->fish[i];
+
+        vec2 delta;
+        glm_vec2_sub(fish->position, position, delta);
+
+        float distance = koi_length(delta);
+
+        if (distance <= 1e-5f || distance >= 0.45f)
+            continue;
+
+        float q = 1.0f - distance / 0.45f;
+
+        float impulse = 0.55f * q * q;
+
+        koi_normalize(delta);
+
+        glm_vec2_scale(delta, impulse, delta);
+
+        glm_vec2_add(fish->velocity, delta, fish->velocity);
+
+        fish->fear = fminf(1.0f, fish->fear + impulse * 0.8f);
+    }
+
+    game->panic = fminf(1.0f, game->panic + 0.10f);
+}
+
+static void koi_feed(KoiGame *game, const vec2 position) {
+    if (game->food_stock == 0)
+        return;
+
+    for (uint32_t i = 0; i < KOI_FOOD_COUNT; ++i) {
+        KoiFood *food = &game->food[i];
+
+        if (food->active)
+            continue;
+
+        glm_vec2_copy(position, food->position);
+
+        food->life   = 7.0f;
+        food->value  = 1.0f;
+        food->active = 1;
+
+        --game->food_stock;
+
+        koi_push_ripple(game, position, 0.0028f);
+
+        return;
+    }
+}
+
+static void koi_update_food(KoiGame *game, float dt) {
+    for (uint32_t i = 0; i < KOI_FOOD_COUNT; ++i) {
+        KoiFood *food = &game->food[i];
+
+        if (!food->active)
+            continue;
+
+        food->life -= dt;
+
+        if (food->life <= 0.0f) {
+            food->active = 0;
+            continue;
+        }
+
+        for (uint32_t j = 0; j < KOI_FISH_COUNT; ++j) {
+            KoiFish *fish = &game->fish[j];
+
+            float distance = koi_distance(fish->position, food->position);
+
+            if (distance >= 0.07f)
+                continue;
+
+            food->active = 0;
+
+            fish->hunger = fmaxf(0.0f, fish->hunger - food->value);
+
+            fish->happiness = fminf(1.0f, fish->happiness + 0.20f);
+
+            if (game->combo_time > 0.0f)
+                ++game->combo;
+            else
+                game->combo = 1;
+
+            game->combo_time = 2.0f;
+
+            game->score += 100u * game->combo;
+
+            ++game->eaten_count;
+
+            if (game->eaten_count >= 12)
+                game->state = KOI_GAME_WON;
+
+            break;
+        }
+    }
+}
+
+static void koi_update_fish(KoiGame *game, float dt) {
+    for (uint32_t i = 0; i < KOI_FISH_COUNT; ++i) {
+        KoiFish *fish = &game->fish[i];
+
+        vec2 to_target;
+        glm_vec2_sub(fish->target, fish->position, to_target);
+
+        float target_distance = koi_length(to_target);
+
+        if (target_distance < 0.12f)
+            koi_set_target(game, fish);
+
+        koi_normalize(to_target);
+
+        vec2 desired;
+        glm_vec2_scale(to_target, fish->cruise, desired);
+
+        /*
+            Food attraction is deliberately weak.
+            Otherwise six supposedly independent fish become one
+            beige/white missile converging on the same crumb.
+        */
+        for (uint32_t f = 0; f < KOI_FOOD_COUNT; ++f) {
+            const KoiFood *food = &game->food[f];
+
+            if (!food->active)
+                continue;
+
+            vec2 delta;
+            glm_vec2_sub(food->position, fish->position, delta);
+
+            float distance = koi_length(delta);
+
+            if (distance >= 0.75f)
+                continue;
+
+            float weight = 1.0f - distance / 0.75f;
+
+            float attraction = 0.10f * weight * (0.35f + fish->hunger);
+
+            koi_normalize(delta);
+
+            glm_vec2_scale(delta, attraction, delta);
+
+            glm_vec2_add(desired, delta, desired);
+        }
+
+        for (uint32_t p = 0; p < 19; ++p) {
+            float dx = fish->position[0] - k_pad_x[p];
+
+            float dy = fish->position[1] - k_pad_y[p];
+
+            float distance = sqrtf(dx * dx + dy * dy);
+
+            float radius = k_pad_radius[p] + 0.10f + fish->size * 0.5f;
+
+            if (distance > 1e-5f && distance < radius + 0.15f) {
+                float push = (radius + 0.15f - distance) / 0.15f * 0.25f;
+
+                desired[0] += dx / distance * push;
+
+                desired[1] += dy / distance * push;
+            }
+        }
+
+        if (fish->position[0] < 0.45f)
+            desired[0] += (0.45f - fish->position[0]) * 0.8f;
+
+        if (fish->position[0] > 2.55f)
+            desired[0] -= (fish->position[0] - 2.55f) * 0.8f;
+
+        if (fish->position[1] < 0.20f)
+            desired[1] += (0.20f - fish->position[1]) * 0.8f;
+
+        if (fish->position[1] > 0.80f)
+            desired[1] -= (fish->position[1] - 0.80f) * 0.8f;
+
+        for (uint32_t j = 0; j < KOI_FISH_COUNT; ++j) {
+            if (i == j)
+                continue;
+
+            vec2 delta;
+            glm_vec2_sub(fish->position, game->fish[j].position, delta);
+
+            float distance = koi_length(delta);
+
+            if (distance <= 1e-5f || distance >= 0.30f)
+                continue;
+
+            float push = (0.30f - distance) * 0.5f;
+
+            koi_normalize(delta);
+
+            glm_vec2_scale(delta, push, delta);
+
+            glm_vec2_add(desired, delta, desired);
+        }
+
+        desired[0] *= 1.0f - 0.35f * fish->fear;
+
+        desired[1] *= 1.0f - 0.35f * fish->fear;
+
+        float response = fminf(1.0f, dt * 1.6f);
+
+        fish->velocity[0] += (desired[0] - fish->velocity[0]) * response;
+
+        fish->velocity[1] += (desired[1] - fish->velocity[1]) * response;
+
+        float speed = koi_length(fish->velocity);
+
+        if (speed > 0.55f) {
+            glm_vec2_scale(fish->velocity, 0.55f / speed, fish->velocity);
+
+            speed = 0.55f;
+        }
+
+        glm_vec2_muladds(fish->velocity, dt, fish->position);
+
+        if (speed > 0.015f) {
+            float target_heading = atan2f(fish->velocity[1], fish->velocity[0]);
+
+            float delta = target_heading - fish->heading;
+
+            while (delta > KOI_PI)
+                delta -= KOI_TAU;
+
+            while (delta < -KOI_PI)
+                delta += KOI_TAU;
+
+            fish->heading += delta * fminf(1.0f, dt * 2.5f);
+        }
+
+        fish->wag += dt * (2.2f + speed * 24.0f);
+
+        fish->hunger = fminf(1.0f, fish->hunger + dt * 0.01f);
+
+        fish->fear = fmaxf(0.0f, fish->fear - dt * 0.7f);
+
+        fish->happiness = fmaxf(0.0f, fish->happiness - dt * 0.015f);
+
+        if (speed > 0.12f && fish->fear < 0.5f && koi_rand01(game) < dt * 0.9f) {
+            koi_push_ripple(game, fish->position, 0.0007f);
+        }
+    }
+}
+
+void koi_game_init(KoiGame *game, uint32_t seed) {
+    memset(game, 0, sizeof(*game));
+
+    game->rng_state = seed ? seed : 0x12345678u;
+
+    game->food_stock = 20;
+    game->round_time = KOI_ROUND_TIME;
+    game->combo      = 1;
+    game->state      = KOI_GAME_PLAYING;
+
+    static const float initial_x[KOI_FISH_COUNT] = {0.85f, 2.15f, 1.85f, 1.35f, 0.75f, 2.50f};
+
+    static const float initial_y[KOI_FISH_COUNT] = {0.62f, 0.68f, 0.42f, 0.30f, 0.22f, 0.18f};
+
+    static const float initial_size[KOI_FISH_COUNT] = {0.105f, 0.098f, 0.112f, 0.100f, 0.093f, 0.088f};
+
+    static const uint32_t initial_type[KOI_FISH_COUNT] = {0, 1, 4, 2, 3, 5};
+
+    static const float initial_seed[KOI_FISH_COUNT] = {0.31f, 0.77f, 0.12f, 0.55f, 0.90f, 0.44f};
+
+    for (uint32_t i = 0; i < KOI_FISH_COUNT; ++i) {
+        KoiFish *fish = &game->fish[i];
+
+        glm_vec2_copy((vec2){initial_x[i], initial_y[i]}, fish->position);
+
+        glm_vec2_copy((vec2){0.03f, 0.0f}, fish->velocity);
+
+        fish->size = initial_size[i];
+
+        fish->heading = koi_rand01(game) * KOI_TAU;
+
+        fish->wag = koi_rand01(game) * 10.0f;
+
+        fish->cruise = 0.05f + koi_rand01(game) * 0.035f;
+
+        fish->hunger    = 0.35f;
+        fish->fear      = 0.0f;
+        fish->happiness = 0.5f;
+
+        fish->type = initial_type[i];
+        fish->seed = initial_seed[i];
+
+        koi_set_target(game, fish);
+    }
+}
+
+void koi_game_restart(KoiGame *game) {
+    uint32_t seed = game->rng_state;
+
+    koi_game_init(game, seed);
+}
+
+void koi_game_input(KoiGame *game, KoiInputButton button, const vec2 pond_position) {
+    if (game->state != KOI_GAME_PLAYING)
+        return;
+
+    switch (button) {
+    case KOI_INPUT_FEED:
+        koi_feed(game, pond_position);
+        break;
+
+    case KOI_INPUT_STIR:
+        koi_stir(game, pond_position);
+        break;
+
+    default:
+        break;
+    }
+}
+
+void koi_game_update(KoiGame *game, float dt) {
+    if (game->state != KOI_GAME_PLAYING)
+        return;
+
+    game->time += dt;
+
+    game->round_time = fmaxf(0.0f, game->round_time - dt);
+
+    game->combo_time = fmaxf(0.0f, game->combo_time - dt);
+
+    if (game->combo_time <= 0.0f)
+        game->combo = 1;
+
+    game->panic = fmaxf(0.0f, game->panic - dt * 0.035f);
+
+    koi_update_food(game, dt);
+
+    koi_update_fish(game, dt);
+
+    if (game->panic >= 1.0f || game->round_time <= 0.0f) {
+        if (game->eaten_count < 12)
+            game->state = KOI_GAME_LOST;
+    }
+}
+
+void koi_game_write_gpu(const KoiGame *game, KoiPondGpu *gpu) {
+    memset(gpu, 0, sizeof(*gpu));
+
+    for (uint32_t i = 0; i < KOI_FISH_COUNT; ++i) {
+        const KoiFish *fish = &game->fish[i];
+
+        gpu->fish[i][0] = fish->position[0];
+
+        gpu->fish[i][1] = fish->position[1];
+
+        gpu->fish[i][2] = fish->heading;
+
+        gpu->fish[i][3] = fish->wag;
+
+        gpu->fish_meta[i][0] = fish->size;
+
+        gpu->fish_meta[i][1] = (float)fish->type;
+
+        gpu->fish_meta[i][2] = fish->seed;
+
+        gpu->fish_meta[i][3] = fish->happiness;
+    }
+
+    for (uint32_t i = 0; i < KOI_RIPPLE_COUNT; ++i) {
+        const KoiRipple *ripple = &game->ripples[i];
+
+        gpu->ripple[i][0] = ripple->position[0];
+
+        gpu->ripple[i][1] = ripple->position[1];
+
+        gpu->ripple[i][2] = ripple->birth_time;
+
+        gpu->ripple[i][3] = ripple->amplitude;
+    }
+
+    for (uint32_t i = 0; i < KOI_FOOD_COUNT; ++i) {
+        const KoiFood *food = &game->food[i];
+
+        gpu->food[i][0] = food->position[0];
+
+        gpu->food[i][1] = food->position[1];
+
+        gpu->food[i][2] = food->life;
+
+        gpu->food[i][3] = (float)food->active;
+    }
+
+    gpu->game_misc[0] = (float)game->score;
+
+    gpu->game_misc[1] = (float)game->combo;
+
+    gpu->game_misc[2] = game->panic;
+
+    gpu->game_misc[3] = (float)game->food_stock;
+}
+static bool koi_pond_init(Renderer *r, KoiPondRenderer *pond) {
+    KoiPondGpu zero = {0};
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        pond->frames[i].gpu_data = buffer_pool_alloc(&r->gpu_pool, sizeof(KoiPondGpu), 16);
+
+        if (!pond->frames[i].gpu_data.size)
+            return false;
+    }
+    static VkFormat color_formats[1];
+    color_formats[0]                 = r->hdr_color[0].format;
+    GraphicsPipelineConfig koiconfig = {
+        .vert_path = "compiledshaders/koi_pond.vert.spv",
+        .frag_path = "compiledshaders/koi_pond.frag.spv",
+
+        // Fullscreen triangle has no meaningful back/front face.
+        .cull_mode    = VK_CULL_MODE_NONE,
+        .front_face   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .polygon_mode = VK_POLYGON_MODE_FILL,
+
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+
+        // The pond shader produces a complete image. Depth testing is
+        // unnecessary because there are no scene depth relationships here.
+        .depth_test_enable  = false,
+        .depth_write_enable = false,
+        .depth_compare_op   = VK_COMPARE_OP_ALWAYS,
+
+        .color_attachment_count = 1,
+        .color_formats          = color_formats,
+
+        // No depth attachment participates in dynamic rendering.
+        .depth_format = VK_FORMAT_UNDEFINED,
+
+        // The shader writes the final HDR pixel directly.
+        // Zero-initialized blend state should mean blending disabled in
+        // your ColorAttachmentBlend implementation.
+        .blends = {0},
+    };
+
+    r->EnginePipelines.koi_pond = pipeline_create_graphics(r, &koiconfig);
+    return true;
+}
+static void koi_pond_upload_barrier(VkCommandBuffer cmd, BufferSlice slice) {
+    VkBufferMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+
+        .dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+
+        .buffer = slice.buffer,
+        .offset = slice.offset,
+        .size   = slice.size,
+    };
+
+    VkDependencyInfo dependency = {
+        .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers    = &barrier,
+    };
+
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+PUSH_CONSTANT(KoiPondPush, uint64_t pond_address;);
+static void pass_koi_pond(Renderer *r, KoiPondRenderer *pond, VkCommandBuffer cmd) {
+    uint32_t image = r->swapchain.current_image;
+
+    GPU_SCOPE(&r->gpuprofiler[r->current_frame], cmd, "Koi Pond", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+        flush_barriers(r, cmd);
+
+        VkRenderingAttachmentInfo color = {
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = r->hdr_color[image].view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+        };
+
+        VkRenderingInfo rendering = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea =
+                {
+                    .offset = {0, 0},
+                    .extent = r->swapchain.extent,
+                },
+            .layerCount           = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments    = &color,
+        };
+
+        vkCmdBeginRendering(cmd, &rendering);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          r->render_pipelines.pipelines[r->EnginePipelines.koi_pond]);
+
+        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
+        KoiPondFrame *frame = &pond->frames[r->current_frame];
+
+        KoiPondPush push = {
+            .pond_address = buffer_slice_address(r, pond->frames[r->current_frame].gpu_data),
+
+        };
+
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        vkCmdEndRendering(cmd);
+    }
+}
 int main() {
 
     graphics_init();
+
+    KoiPondRenderer pond = {0};
+    KoiGame         game = {0};
+
+    koi_game_init(&game, 0x12345678u);
+
+    if (!koi_pond_init(g_renderer, &pond)) {
+        return 1;
+    }
+
     dmon_init();
 
     g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
@@ -5150,9 +5873,10 @@ int main() {
         static bool shot_held = false;
         if (glfwGetKey(g_renderer->window, GLFW_KEY_R) == GLFW_PRESS) {
             if (!shot_held) {
-                char path[256];
-                snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
+                char path[512];
+                capture_make_screenshot_path(path, sizeof(path));
                 capture_take_screenshot(g_renderer, path);
+
                 shot_held = true;
             }
         } else
@@ -5163,8 +5887,9 @@ int main() {
         if (glfwGetKey(g_renderer->window, GLFW_KEY_F9) == GLFW_PRESS) {
             if (!rec_held) {
                 if (!g_renderer->capture.recording) {
-                    char path[256];
-                    snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)glfwGetTime());
+                    char path[512];
+                    capture_make_video_path(path, sizeof(path));
+
                     capture_start_video(g_renderer, path, 60);
                 } else {
                     capture_stop_video(g_renderer);
@@ -5184,7 +5909,6 @@ int main() {
         Renderer       *r          = g_renderer;
         VkCommandBuffer cmd        = renderer->frames[renderer->current_frame].cmdbuf;
         GpuProfiler    *frame_prof = &renderer->gpuprofiler[renderer->current_frame];
-
         vk_cmd_begin(cmd, false);
         gpu_profiler_begin_frame(frame_prof, cmd);
 
@@ -5206,7 +5930,32 @@ int main() {
             }
         }
 
-        pass_fire(r, cmd);
+        // pass_fire(r, cmd);
+        //
+        //
+        KoiPondPush push = {};
+
+        koi_game_update(&game, r->dt);
+
+        BufferSlice snapshot_slice = buffer_pool_alloc(&r->cpu_pool, sizeof(KoiPondGpu), 16);
+
+        assert(snapshot_slice.mapped);
+
+        KoiPondGpu *snapshot = snapshot_slice.mapped;
+
+        koi_game_write_gpu(&game, snapshot);
+
+        renderer_upload_buffer_to_slice(r, cmd, pond.frames[r->current_frame].gpu_data, snapshot, sizeof(*snapshot),
+                                        16);
+        KoiPondFrame *pond_frame = &pond.frames[r->current_frame];
+
+        renderer_upload_buffer_to_slice(r, cmd, pond_frame->gpu_data, snapshot, sizeof(*snapshot), 16);
+
+        // barrier
+        flush_barriers(r, cmd);
+
+        pass_koi_pond(r, &pond, cmd);
+
         post_pass(r, cmd);
         pass_smaa(r, cmd);
         pass_ldr_to_swapchain(r, cmd);

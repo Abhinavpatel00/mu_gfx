@@ -29,7 +29,7 @@
 
 
 #define MAX_COLOR_ATTACHMENTS 8
-#define VALIDATION false
+#define VALIDATION true
 
 
 // Root capture directory. Everything user-facing goes under here.
